@@ -96,9 +96,9 @@ def read_apps(path, tv_id):
         if not cfg:
             raise SystemExit("--apps tv: no LG TV (\"kind\": \"lg\") in config.json" + (f" with id {tv_id}" if tv_id else ""))
         tv = lg.LGTV(cfg)
-        if not os.path.exists(tv.key_file):
-            raise SystemExit(f"--apps tv: this TV has not accepted the remote yet ({os.path.relpath(tv.key_file, ROOT)} "
-                             "is missing). Start the bridge with this TV and press Accept on the TV, or use --apps <file>.")
+        if not tv._key():
+            raise SystemExit("--apps tv: this TV has not accepted the remote yet. "
+                             "Start the bridge with this TV and press Accept on the TV, or use --apps <file>.")
 
         async def run():
             await tv._resolve()

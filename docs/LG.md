@@ -258,6 +258,122 @@ gives; it may differ by year).
 Unlike a Samsung, an LG tells the bridge nothing (not even whether it is on) until the remote is
 accepted.
 
+### Encrypted pairing-key storage on Linux (optional)
+
+For a new Linux setup, the LG remote's client key can be kept with the operating system's
+`systemd-creds` encrypted credential storage instead of `bridge/data/lg-<id>-key.txt`.
+This requires **systemd 259 or newer**, including its credential service for a non-root user.
+Set these nonsecret values in the bridge service's environment before its first connection:
+
+```ini
+Environment=COUCHTV_CREDENTIAL_BACKEND=systemd
+Environment=COUCHTV_CREDENTIAL_SCOPE=user
+Environment=COUCHTV_CREDENTIAL_DIR=/home/couchtv/.local/share/couchtv-credentials
+```
+
+Use an absolute directory **outside the checkout**, owned by the bridge user with mode `0700`.
+The bridge creates it if needed, stores only encrypted `.cred` files with mode `0600`, and pipes
+plaintext directly to and from `/usr/bin/systemd-creds`. Encryption explicitly uses the OS host
+key; decryption refuses null-key credentials. `user` binds credentials to the service account and
+machine. A root-run service can explicitly choose `system` scope instead. Confirm encryption and
+decryption work as the exact bridge user before pairing a real TV: an unavailable credential
+service, an older systemd, or failed encryption stops the operation without a plaintext fallback.
+Do not disable credential-service access in the unit's sandbox without testing this path.
+
+The host encryption key lives in systemd's protected OS storage. A root user, or someone with a
+complete backup including that key, can decrypt host-key credentials; this does not protect a
+compromised host. Retain that OS key when restoring encrypted credentials, or pair the TV again.
+See [systemd-creds](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html).
+
+Leaving `COUCHTV_CREDENTIAL_BACKEND` unset preserves the existing file behavior for older
+installations. Secure mode refuses to start if this TV already has a legacy plaintext key:
+migrate it deliberately before enabling secure mode. It never reads, copies, or deletes the old
+key automatically. This setting covers the **LG network remote key only**; Developer Mode's SSH
+private key and passphrase need their own secure storage and runtime delivery.
+
+#### Secure LG CLI and Claude launchers
+
+`scripts/ares-secure.py` delivers the Developer Mode SSH configuration to LG's CLI without
+keeping a plaintext private key or passphrase on persistent storage. Provision one encrypted
+`lg-ares-config` credential using the same systemd store. Its plaintext structure is LG CLI's
+device array: each entry has `name`, `profile: "tv"`, `host`, `port: 9922`, `username: "prisoner"`,
+`privateKey` (the raw SSH private-key bytes encoded as base64), `passphrase`, `files: "sftp"`, and
+`default`. The base64 is only the format LG's CLI expects, **not** encryption; the complete
+configuration must enter systemd's encrypted store directly from memory. Do not put it in a
+project JSON file or shell command, and do not run the CLI's normal `--getkey` setup through
+this wrapper: that path can log the passphrase.
+
+Provide these additional nonsecret service settings:
+
+```ini
+RuntimeDirectory=couchtv
+RuntimeDirectoryMode=0700
+Environment=COUCHTV_RUNTIME_DIR=/run/couchtv
+Environment=COUCHTV_ARES_BIN_DIR=/opt/couchtv-tools/node_modules/.bin
+Environment=COUCHTV_CLAUDE_BIN=/opt/couchtv-tools/claude
+```
+
+`RuntimeDirectory=` makes `/run/couchtv` only in a **system** service, so run the bridge as one
+with `User=` rather than as a user service. The whole unit, as it runs on the first setup (an
+LG OLED CX, the bridge in a Proxmox container on Ubuntu 26.04, systemd 259), saved as
+`/etc/systemd/system/couch-tv-bridge.service`, then `systemctl enable --now couch-tv-bridge`:
+
+```ini
+[Unit]
+Description=Couch TV bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=couchtv
+Group=couchtv
+WorkingDirectory=/home/couchtv/couch-tv
+Environment=PATH=/home/couchtv/.local/bin:/opt/couchtv-tools/node/bin:/usr/bin:/bin
+Environment=COUCHTV_CREDENTIAL_BACKEND=systemd
+Environment=COUCHTV_CREDENTIAL_SCOPE=user
+Environment=COUCHTV_CREDENTIAL_DIR=/home/couchtv/.local/share/couchtv-credentials
+Environment=COUCHTV_RUNTIME_DIR=/run/couchtv
+Environment=COUCHTV_ARES_BIN_DIR=/opt/couchtv-tools/lg/node_modules/.bin
+Environment=COUCHTV_CLAUDE_BIN=/opt/couchtv-tools/claude
+Environment=CLAUDE_BIN=/home/couchtv/.local/bin/claude-secure
+RuntimeDirectory=couchtv
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+ExecStart=/home/couchtv/couch-tv-venv/bin/python /home/couchtv/couch-tv/bridge/server.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+There, pairing, the daily Extend (`ares-launch`) and the countdown read (`ares-novacom`) all ran
+through the encrypted store from this service.
+
+The runtime directory must already exist, belong to the bridge user, have mode `0700`, and
+reside on a verified `tmpfs` mount. For each CLI invocation the wrapper creates a separate
+private directory there, writes mode-`0600` configuration at
+`APPDATA/.webos/tv/novacom-devices.json`, and removes it when the child exits, times out, or the
+wrapper receives a normal termination signal. `HOME` is never changed. CLI output is captured
+and replaced by a generic result, so connection diagnostics cannot expose credentials.
+
+Create executable symlinks named `ares-launch`, `ares-install`, `ares-novacom`, `ares-device`,
+and `ares-device-info` to `ares-secure.py` in a wrapper directory. Put that directory on the
+bridge's `PATH`, and set the TV's `ares_launch` to its `ares-launch`. Its `ares-novacom` only
+allows the exact Developer Mode countdown token read used by the bridge, and only emits the
+validated token to a pipe. Other SSH commands, credential setup, and verbose CLI output are
+refused. The real CLI must remain in the separate `COUCHTV_ARES_BIN_DIR`, not the wrapper folder.
+
+For the optional Claude subscription assistant, `scripts/claude-secure.py` reads the encrypted
+`claude-oauth` credential, removes `ANTHROPIC_API_KEY` from the child environment, and passes
+the subscription token as `CLAUDE_CODE_OAUTH_TOKEN` only when executing the official Claude
+binary. Point `CLAUDE_BIN` at this executable launcher. It preserves all CLI arguments,
+including the bridge's MCP configuration, and never writes the subscription credential to a
+file or passes it as a command-line argument. Provision the subscription credential separately
+through a secure input flow; the launcher does not sign in, create tokens, or fall back to a
+paid API key.
+
 ### 7. Check it
 
 - Switch the TV off and on with its own remote. Within a few seconds couch-tv opens.
@@ -386,6 +502,10 @@ repo yet.
    `bridge/data/lg-<id>-key.txt` and `bridge/data/lg-<id>-devmode.json`. The client key is then
    gone from the computer. The TV may keep its own note of the accepted remote, which is harmless
    (where to remove it on the TV differs by year and was not checked).
-4. On the computer: `ares-setup-device -r lounge`.
+   With encrypted storage (`COUCHTV_CREDENTIAL_BACKEND=systemd`) the key is not in `bridge/data`:
+   delete `lg-<id>-client-key.cred`, and `lg-ares-config.cred` (the Developer Mode profile), from
+   `COUCHTV_CREDENTIAL_DIR` instead, and `claude-oauth.cred` if the assistant used one.
+4. On the computer: `ares-setup-device -r lounge` (with encrypted storage there is no ares profile
+   to remove: deleting `lg-ares-config.cred` in step 3 did it).
 
 Nothing else on the TV was changed.
