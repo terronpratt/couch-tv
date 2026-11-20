@@ -32,6 +32,16 @@ def validate_token(value):
     return value
 
 
+def read_hidden_token(max_lines=8):
+    """`claude setup-token` wraps its token over two lines, and copying it keeps the line break,
+    while a hidden prompt stops at the first one: a first try saved only the first 79 characters.
+    So keep reading hidden lines and join them, until an empty line (Return on its own)."""
+    parts = [getpass.getpass("Claude subscription token (hidden): ").strip()]
+    while parts[-1] and len(parts) < max_lines:
+        parts.append(getpass.getpass("Rest of the token if it wrapped, else just press Return (hidden): ").strip())
+    return "".join(parts)
+
+
 def write_status(state, *, ok=False, container=None):
     """Only fixed, nonsecret status fields; atomically invalidate any previous success."""
     directory = ROOT / "build"
@@ -87,9 +97,10 @@ def interactive(args):
     print("  claude setup-token")
     print("Approve Claude's browser sign-in yourself, then copy the subscription token it produces.")
     print("Paste it below. Typing is hidden; do not paste it into chat or save it in a file.")
+    print("If the token was on two lines, it asks for the rest: paste it, then press Return on the empty prompt.")
     with warnings.catch_warnings():
         warnings.simplefilter("error", getpass.GetPassWarning)
-        token = validate_token(getpass.getpass("Claude subscription token (hidden): ").strip())
+        token = validate_token(read_hidden_token())
     remote = [
         "pct", "exec", str(args.container), "--", "runuser", "-u", "couchtv", "--",
         "env", "COUCHTV_CREDENTIAL_BACKEND=systemd", "COUCHTV_CREDENTIAL_SCOPE=user",

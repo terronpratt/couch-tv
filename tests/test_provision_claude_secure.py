@@ -37,9 +37,11 @@ class Provisioning(unittest.TestCase):
     def test_token_uses_stdin_only_and_status_resets_before_input(self):
         provision.write_status("saved", ok=True, container=107)
 
+        lines = iter([TOKEN[:40], TOKEN[40:], ""])   # a wrapped paste arrives as two lines
+
         def hidden_input(_):
             self.assertEqual(json.loads(self.status.read_text()), {"ok": False, "state": "awaiting-entry"})
-            return TOKEN
+            return next(lines)
 
         with patch.object(provision.sys.stdin, "isatty", return_value=True), \
                 patch.object(provision.getpass, "getpass", side_effect=hidden_input), \
@@ -63,7 +65,7 @@ class Provisioning(unittest.TestCase):
 
     def run_main(self, *, token=TOKEN, result=None, side_effect=None, tty=True):
         with patch.object(provision.sys.stdin, "isatty", return_value=tty), \
-                patch.object(provision.getpass, "getpass", return_value=token), \
+                patch.object(provision.getpass, "getpass", side_effect=[token, ""]), \
                 patch.object(provision.subprocess, "run", return_value=result, side_effect=side_effect) as run, \
                 patch.object(provision.sys, "argv", ["provision-claude-secure.py", "--server", "192.0.2.2", "--container", "107"]), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
