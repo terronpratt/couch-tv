@@ -43,6 +43,7 @@ import aiohttp
 
 import apps
 import config
+import credential_store
 from samsung import netflix_id, youtube_id
 from tv import TVUnavailable
 
@@ -154,6 +155,13 @@ class LGTV:
         self.ares_launch = cfg.get("ares_launch") or os.environ.get("ARES_LAUNCH") or None
         self.ports = [int(cfg["port"])] if cfg.get("port") else [3000, 3001]
         self.key_file = os.path.join(config.DATA, f"lg-{self.id}-key.txt")
+        self._credential_store = credential_store.configured_store()
+        self._credential_name = f"lg-{self.id}-client-key"
+        if self._credential_store is not None:
+            self._credential_store.validate_name(self._credential_name)  # before contacting the TV
+            if os.path.lexists(self.key_file):
+                raise credential_store.CredentialStoreError(
+                    "an existing plaintext LG key needs explicit migration before secure mode is enabled")
         self.devmode_file = os.path.join(config.DATA, f"lg-{self.id}-devmode.json")
         self.devleft_file = os.path.join(config.DATA, f"lg-{self.id}-devleft.json")
         # Paired means the TV accepted the remote once (a client key is kept). Unlike a Samsung, an
@@ -271,11 +279,22 @@ class LGTV:
         return self.ip
 
     def _key(self):
+        if self._credential_store is not None:
+            return self._credential_store.read(self._credential_name)
         try:
             with open(self.key_file) as f:
                 return f.read().strip() or None
         except FileNotFoundError:
             return None
+
+    def _save_key(self, value):
+        if self._credential_store is not None:
+            self._credential_store.write(self._credential_name, value)
+            return
+        os.makedirs(os.path.dirname(self.key_file), exist_ok=True)
+        with open(self.key_file, "w") as f:
+            f.write(value)
+        os.chmod(self.key_file, 0o600)
 
     def _urls(self):
         """Plain on 3000 first, then encrypted on 3001 (newer firmware refuses the plain one)."""
@@ -349,10 +368,7 @@ class LGTV:
                 elif j.get("type") == "registered":
                     new = (j.get("payload") or {}).get("client-key")
                     if new and new != key:
-                        os.makedirs(os.path.dirname(self.key_file), exist_ok=True)
-                        with open(self.key_file, "w") as f:
-                            f.write(str(new))
-                        os.chmod(self.key_file, 0o600)
+                        self._save_key(str(new))
                         self.log.info("the TV accepted the remote (client key kept)")
                     return
                 elif j.get("type") == "error":
