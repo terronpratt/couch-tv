@@ -41,26 +41,28 @@ def split_title(title):
             "episode_title": ep_title, "episode": ep_no, "kind": "episode", "title": m.group("show")}
 
 
-SLASH_DATE_RE = re.compile(r"\s*(\d{1,2})/(\d{1,2})/\d{2,4}\s*$")
+SLASH_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})$")
 
 
-def _month_first(dates):
-    """Netflix writes the date in the account's locale: day first in Australia ("30/7/13"), month
-    first in the US ("7/30/13"). Decide once for the whole file, from the rows only one order can
-    read: reading row by row turned a US "4/12/26" (12 April) into 4 December."""
-    day_first = month_first = 0
-    for text in dates:
-        m = SLASH_DATE_RE.match(text or "")
+def date_order(texts):
+    """'dmy' or 'mdy' for the dates written with slashes. A file is in one order, so one date whose
+    first number is over 12 (25/3/24) says day first, and one whose second number is over 12
+    (3/25/24, a Canadian export) says month first. Nothing settles it: day first, as before."""
+    first_big = second_big = False
+    for t in texts:
+        m = SLASH_RE.match((t or "").strip())
         if m:
-            day_first += int(m.group(1)) > 12
-            month_first += int(m.group(2)) > 12
-    return month_first > day_first
+            first_big |= int(m.group(1)) > 12
+            second_big |= int(m.group(2)) > 12
+    return "mdy" if second_big and not first_big else "dmy"
 
 
-def _date(text, month_first=False):
+def _date(text, order="dmy"):
+    """Netflix writes the date in the account's locale: Australian accounts use day first, a
+    Canadian or American one month first (order, from date_order)."""
     text = (text or "").strip()
-    slash = ("%m/%d/%Y", "%m/%d/%y") if month_first else ("%d/%m/%Y", "%d/%m/%y")
-    for fmt in (*slash, "%Y-%m-%d", "%d.%m.%y", "%d.%m.%Y"):
+    slashes = ["%m/%d/%Y", "%m/%d/%y"] if order == "mdy" else ["%d/%m/%Y", "%d/%m/%y"]
+    for fmt in slashes + ["%Y-%m-%d", "%d.%m.%y", "%d.%m.%Y", "%d/%m/%Y", "%d/%m/%y", "%m/%d/%y", "%m/%d/%Y"]:
         try:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
@@ -98,14 +100,17 @@ def parse(text, person_for):
     if not kind:
         return []
     header = [c.strip() for c in rows[0]]
-    month_first = kind == "profile" and _month_first(dict(zip(header, raw)).get("Date") for raw in rows[1:])
+    order = "dmy"
+    if kind == "profile" and "Date" in header:
+        di = header.index("Date")
+        order = date_order(r[di] for r in rows[1:] if len(r) > di)
     out = []
     for raw in rows[1:]:
         if not raw or not any(raw):
             continue
         r = dict(zip(header, raw))
         if kind == "profile":
-            when = _date(r.get("Date"), month_first)
+            when = _date(r.get("Date"), order)
             if not when:
                 continue
             t = split_title(r.get("Title"))

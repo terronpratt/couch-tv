@@ -10,8 +10,8 @@ android {
         applicationId = "dev.couchtv.ontv"
         minSdk = 23          // Android 6.0. Wireless debugging pairing needs Android 11+ on the TV.
         targetSdk = 34
-        versionCode = 12
-        versionName = "0.12"
+        versionCode = 21
+        versionName = "0.13.8"
     }
     buildFeatures { buildConfig = true }
     // Test builds: when COUCHTV_KEYSTORE names a keystore (a debug-style key, alias androiddebugkey,
@@ -32,6 +32,13 @@ android {
             // Signed with the local debug key so it installs without a keystore. Use your own key to publish.
             signingConfig = signingConfigs.findByName("fixed") ?: signingConfigs.getByName("debug")
         }
+        // couch-tv-ontv-watch.apk: the release plus the home watch (src/watch/AndroidManifest.xml), for a
+        // computer to install (Fire TV). The plain release has no accessibility service, so Play Protect
+        // lets a phone only install from Downloader through.
+        create("watch") {
+            initWith(getByName("release"))
+            matchingFallbacks += listOf("release")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -51,6 +58,10 @@ dependencies {
     implementation("org.conscrypt:conscrypt-android:2.5.3")
     // Makes the self-signed certificate the ADB TLS handshake needs.
     implementation("org.bouncycastle:bcpkix-jdk15to18:1.81")
+    // Unit tests for the plain Kotlin rules (KeepMergeTest), run with testDebugUnitTest (EPL 1.0).
+    testImplementation("junit:junit:4.13.2")
+    // A real org.json for the tests that read and build JSON (AskWireTest): Android's own copy is only a stub on a computer (JSON licence).
+    testImplementation("org.json:json:20240303")
 }
 
 // The phone remote and the TV home are built elsewhere in the repo. Copy them in before every build.
@@ -64,6 +75,10 @@ val copyWeb by tasks.registering(Copy::class) {
     into(layout.projectDirectory.dir("src/main/assets/www"))
     from(remoteDist) { into("remote") }
     from(tvHomeWeb) { into("tv"); exclude("mock.js") }
+    // tv-home/web/loop/: the Loop look's footage and stills (up to 80 MB, scripts/make-loop.sh), git
+    // ignored and only ever shown from the bridge; the on-TV app never uses them, so they stay out.
+    val tvLoop = File(tvHomeWeb, "loop").absoluteFile.normalize()
+    exclude { it.file.absoluteFile.normalize().startsWith(tvLoop) }
     from(file("../../web")) { into("ontv") }
     doFirst {
         if (!File(remoteDist, "index.html").isFile) throw GradleException("No phone remote build at $remoteDist. Run npm run build in remote/ first.")

@@ -13,7 +13,7 @@ The container uses host networking, so Wake-on-LAN and finding TVs work. The bri
 
 ## Set it up
 
-1. Follow the README steps up to the bridge for your TV (steps 1 to 4), on any computer, then copy
+1. Follow the [SETUP.md](SETUP.md) steps up to the bridge for your TV (steps 1 to 4), on any computer, then copy
    the repo to the Docker host with `config.json` and the phone remote built (`remote/dist`).
    Set `bridge.host` in `config.json` to the Docker host's name or address.
 2. Pair the TV (step 3) so that `bridge/data/` holds its keys. You can run `bridge/pair_tv.py`
@@ -39,7 +39,7 @@ The container uses host networking, so Wake-on-LAN and finding TVs work. The bri
 After you change `config.json` or the bridge's code, restart the container:
 `docker compose -f examples/docker/compose.yaml restart`.
 
-Everything in the README about who can reach the bridge still applies: it has no password, so keep
+Everything in [HOW-IT-WORKS.md](HOW-IT-WORKS.md#privacy-and-safety) about who can reach the bridge still applies: it has no password, so keep
 it on your home network and never forward a port to it.
 
 ## Synology note
@@ -51,6 +51,17 @@ some Synologys `scp` fails with "Connection closed". Copying the repo with `tar`
 ```sh
 tar -cf - . | ssh nas 'cd /volume1/docker/couch-tv && tar -xf -'
 ```
+
+From **Windows**, OpenSSH's `scp` fails against DSM with "subsystem request failed on channel 0"
+unless you add `-O` (the older copy protocol). The `tar` over `ssh` copy also works, but in
+PowerShell wrap it in `cmd /c`, because PowerShell's pipeline corrupts the binary stream:
+
+```sh
+cmd /c "tar -cf - . | ssh nas ""cd /volume1/docker/couch-tv && tar -xf -"""
+```
+
+A bridge for an LG in Docker on a Synology (host network) was run end to end, including the power on
+hook and the daily Developer Mode Extend, on an LG 28TQ515S ([LG.md](LG.md), #220, thanks adri07).
 
 The Developer Mode passphrase sits in `examples/docker/.env`, which git ignores. Keep that file
 private.

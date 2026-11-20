@@ -5,8 +5,9 @@ deletes anything from the TV. It only switches things off, so everything can be 
 
 ## Option B: stop the bridge first
 
-The bridge checks once a day that the Google home is still off and switches it off again. Stop it
-**before** you touch the TV, or it can undo your undo.
+The bridge checks once a day that ambient mode (and any ad tracker `apply.sh` switched off) is
+still off and switches it off again. It never switches the Google home off. Stop it **before** you
+touch the TV, or it can undo your undo.
 
 - **macOS:** `launchctl bootout gui/$(id -u)/app.couchtv.bridge`, then delete
   `~/Library/LaunchAgents/app.couchtv.bridge.plist`.
@@ -33,7 +34,10 @@ thing that fails:
    home and setup app, which couch-tv 0.10 and older switched off), switches off the Home button
    watch, and makes the home the TV had before couch-tv the home again.
 2. Removes the couch-tv apps (the home screen app `app.couchtv.launcher` and the "lives on the TV"
-   app `dev.couchtv.ontv`).
+   app `dev.couchtv.ontv`). If you also had a home app of your own from before couch-tv (a private
+   build you made yourself), name its package and it goes in the same step:
+   `EXTRA_APPS="<its package>"`. It refuses anything that looks like part of the TV itself, such as
+   the TV's own home or setup app.
 3. Switches off network debugging, USB debugging and Developer options. Leave out `DEV_OFF=1` to
    keep Developer options on.
 
@@ -63,7 +67,8 @@ To remove only one app by hand, without the rest:
 ## With only the TV remote (no computer)
 
 1. On the couch-tv home, open the **Settings** tile (the gear at the end of the app row; in the
-   Classic look it is a tile in the grid). Or press the Settings button on your remote.
+   Classic look it is a tile in the grid). Or press the Settings button on your remote. Then pick
+   **TV settings**.
 2. **Apps**, then **See all apps**, then **Show system apps**.
 3. If **Google TV Home** or **Setup** says Disabled (couch-tv 0.10 and older switched them off),
    open it and press **Enable**. Ambient mode and the ad tracker are optional.
@@ -90,7 +95,7 @@ restart after step 3 is enough: nothing can connect any more.
 
 - **The TV loops after a restart** (blank screen, restarts by itself, again and again). Seen on a
   Sony Bravia Google TV set up with couch-tv 0.10 or older, which switched off the Google TV home
-  and the setup app. Steps: [README, If your TV loops after a restart](../README.md#if-your-tv-loops-after-a-restart).
+  and the setup app. Steps: [TROUBLESHOOTING.md, If your TV loops after a restart](TROUBLESHOOTING.md#if-your-tv-loops-after-a-restart).
 
 - **The TV forgot its Wi-Fi.** It could happen when couch-tv 0.10 or older switched the setup app
   off, or when it is switched back on.

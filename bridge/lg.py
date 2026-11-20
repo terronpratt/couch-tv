@@ -44,6 +44,7 @@ import aiohttp
 import apps
 import config
 import credential_store
+import messages
 from samsung import netflix_id, youtube_id
 from tv import TVUnavailable
 
@@ -51,6 +52,7 @@ from tv import TVUnavailable
 COUCH_APP = "app.couchtv.home"
 HOME_PACKAGE = "app.couchtv.launcher"
 DEVMODE_APP = "com.palmdts.devmode"
+FG_SUB = "fg-sub"   # the id of the subscription to the app in front
 # How often the Developer Mode countdown is read from LG (it needs the TV on).
 LEFT_EVERY_HOURS = 6
 
@@ -127,10 +129,16 @@ for _a in apps.APPS:
 class LGError(RuntimeError):
     """The TV answered a request with an error."""
 
+    def __init__(self, message, key=None, vars=None):
+        super().__init__(message)
+        self.key = key
+        self.vars = vars
+
 
 class LGTV:
     kind = "lg"
     can_read_media = False
+    INPUT = INPUT
 
     def __init__(self, cfg):
         self.id = cfg["id"]
@@ -164,6 +172,10 @@ class LGTV:
                     "an existing plaintext LG key needs explicit migration before secure mode is enabled")
         self.devmode_file = os.path.join(config.DATA, f"lg-{self.id}-devmode.json")
         self.devleft_file = os.path.join(config.DATA, f"lg-{self.id}-devleft.json")
+        # The port that worked last time, kept per TV so a restart goes straight to it (newer webOS
+        # resets port 3000 and only answers on 3001, couch-tv#71).
+        self.port_file = os.path.join(config.DATA, f"lg-{self.id}-port.json")
+        self._port_seen = self._read_port()
         # Paired means the TV accepted the remote once (a client key is kept). Unlike a Samsung, an
         # LG answers nothing before that, so the watcher asks for it (see _watch).
         self.paired = True
@@ -186,6 +198,7 @@ class LGTV:
         self._ws = None             # the SSAP websocket, once the TV has accepted the remote
         self._url = None
         self._pending = {}
+        self._fg_changed = asyncio.Event()   # set by the TV's message when the app in front changes
         self._n = 0
         self._connect_lock = asyncio.Lock()
         self._pointer_ws = None
@@ -236,7 +249,11 @@ class LGTV:
 
     def require(self):
         if not self.connected:
-            raise TVUnavailable(f"the {self.name.lower()} TV is not answering on the network")
+            raise TVUnavailable(
+                f"the {self.name.lower()} TV is not answering on the network",
+                key="err_driver_not_answering",
+                vars={"name": self.name.lower()},
+            )
 
     def can_deeplink(self, app):
         return app.get("id") in ("netflix", "youtube")
@@ -296,12 +313,39 @@ class LGTV:
             f.write(value)
         os.chmod(self.key_file, 0o600)
 
+    def _read_port(self):
+        try:
+            with open(self.port_file) as f:
+                p = int(json.load(f).get("port"))
+            return p if p in self.ports else None
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
+    def _keep_port(self, url):
+        """Remember which port answered, so the next start tries it first."""
+        try:
+            port = int(url.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+        if port == self._port_seen or len(self.ports) < 2:
+            return
+        self._port_seen = port
+        try:
+            os.makedirs(os.path.dirname(self.port_file), exist_ok=True)
+            with open(self.port_file, "w") as f:
+                json.dump({"port": port}, f)
+        except OSError as e:
+            self.log.warning("could not keep the remote port: %s", e)
+
     def _urls(self):
-        """Plain on 3000 first, then encrypted on 3001 (newer firmware refuses the plain one)."""
+        """Plain on 3000 first, then encrypted on 3001 (newer firmware refuses the plain one). The
+        one that worked last time, in this run or the last, goes first."""
         urls = [f"ws://{self.ip}:{p}" if p != 3001 else f"wss://{self.ip}:{p}" for p in self.ports]
-        if self._url in urls:
-            urls.remove(self._url)
-            urls.insert(0, self._url)
+        first = self._url if self._url in urls else next(
+            (u for u in urls if self._port_seen and u.endswith(f":{self._port_seen}")), None)
+        if first:
+            urls.remove(first)
+            urls.insert(0, first)
         return urls
 
     async def _remote(self, pairing_wait=30):
@@ -321,11 +365,16 @@ class LGTV:
                         url, ssl=False, heartbeat=20, max_msg_size=8 * 1024 * 1024,
                         timeout=aiohttp.ClientWSTimeout(ws_close=5)), 5)
                     self._url = url
+                    self._keep_port(url)
                     break
                 except Exception as e:
                     last = e
             if ws is None:
-                raise TVUnavailable(f"the TV's remote port did not open ({type(last).__name__})")
+                raise TVUnavailable(
+                    f"the TV's remote port did not open ({type(last).__name__})",
+                    key="err_lg_remote_port_failed",
+                    vars={"error": type(last).__name__},
+                )
             try:
                 await self._handshake(ws, pairing_wait)
             except Exception:
@@ -333,13 +382,20 @@ class LGTV:
                 raise
             self._ws = ws
             asyncio.create_task(self._read(ws))
+            try:
+                # the TV then says straight away when the app in front changes (Back out of an
+                # app, the TV coming on), instead of the watcher finding out on its next look
+                await ws.send_json({"id": FG_SUB, "type": "subscribe",
+                                    "uri": "ssap://com.webos.applicationManager/getForegroundAppInfo"})
+            except Exception:
+                pass
             return ws
 
     async def _handshake(self, ws, pairing_wait):
         async def next_msg(wait):
             msg = await asyncio.wait_for(ws.receive(), wait)
             if msg.type != aiohttp.WSMsgType.TEXT:
-                raise TVUnavailable("the TV closed the remote connection")
+                raise TVUnavailable("the TV closed the remote connection", key="err_tv_closed_remote")
             return json.loads(msg.data)
 
         # hello, and the system info newer webOS wants before the register (as aiowebostv does)
@@ -372,11 +428,22 @@ class LGTV:
                         self.log.info("the TV accepted the remote (client key kept)")
                     return
                 elif j.get("type") == "error":
-                    raise TVUnavailable(f"the TV said no to the remote ({j.get('error')}): accept it on the TV "
-                                        "when it asks, and check LG Connect Apps is on in its network settings")
+                    raise TVUnavailable(
+                        f"the TV said no to the remote ({j.get('error')}): accept it on the TV "
+                        "when it asks, and check LG Connect Apps is on in its network settings",
+                        key="err_lg_remote_refused",
+                        vars={"error": j.get("error")},
+                    )
         except asyncio.TimeoutError:
-            raise TVUnavailable("the TV is waiting for someone to accept the remote on its screen" if prompting
-                                else "the TV did not answer the remote's hello") from None
+            if prompting:
+                raise TVUnavailable(
+                    "the TV is waiting for someone to accept the remote on its screen",
+                    key="err_lg_remote_waiting_accept",
+                ) from None
+            raise TVUnavailable(
+                "the TV did not answer the remote's hello",
+                key="err_lg_remote_hello_timeout",
+            ) from None
 
     async def _read(self, ws):
         try:
@@ -387,6 +454,9 @@ class LGTV:
                     j = json.loads(msg.data)
                 except ValueError:
                     continue
+                if j.get("id") == FG_SUB:
+                    self._fg_changed.set()
+                    continue
                 fut = self._pending.get(j.get("id"))
                 if fut and not fut.done():
                     fut.set_result(j)
@@ -396,7 +466,7 @@ class LGTV:
             self._ws = None
         for fut in list(self._pending.values()):
             if not fut.done():
-                fut.set_exception(TVUnavailable("the TV closed the remote connection"))
+                fut.set_exception(TVUnavailable("the TV closed the remote connection", key="err_tv_closed_remote"))
 
     async def _close(self):
         for ws in (self._ws, self._pointer_ws):
@@ -417,14 +487,20 @@ class LGTV:
             await ws.send_json({"id": rid, "type": "request", "uri": f"ssap://{uri}", "payload": payload or {}})
             j = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            raise TVUnavailable(f"the TV did not answer {uri}") from None
+            raise TVUnavailable(
+                f"the TV did not answer {uri}",
+                key="err_lg_request_timeout",
+                vars={"uri": uri},
+            ) from None
         finally:
             self._pending.pop(rid, None)
         if j.get("type") == "error":
-            raise LGError(j.get("error") or "error")
+            msg = j.get("error") or "error"
+            raise LGError(msg, key="err_lg_error", vars={"error": msg})
         p = j.get("payload") or {}
         if p.get("returnValue") is False:
-            raise LGError(p.get("errorText") or p.get("errorCode") or "returnValue false")
+            msg = p.get("errorText") or p.get("errorCode") or "returnValue false"
+            raise LGError(msg, key="err_lg_error", vars={"error": msg})
         return p
 
     async def _command(self, uri, payload=None):
@@ -481,7 +557,7 @@ class LGTV:
             lid = lp.get("id")
             if not lid:
                 continue
-            points.append({"id": lid, "title": lp.get("title") or lid, "icon": lp.get("icon") or lp.get("largeIcon")})
+            points.append({"id": lid, "title": lp.get("title") or lid, "icon": lp.get("largeIcon") or lp.get("icon")})   # largeIcon is 130x130, icon 80x80: a tile is 112 px
             pkg = HOME_PACKAGE if lid == self.app_id else apps.WEBOS_TO_PACKAGE.get(lid) or BY_NAME.get(_plain(lp.get("title")))
             if pkg:
                 found[lid] = pkg
@@ -512,13 +588,14 @@ class LGTV:
                     # prompt: asked again at most every 10 minutes, so nobody is pestered.
                     if self._key() or time.monotonic() - self._prompt_at > 600:
                         try:
-                            await self._remote(pairing_wait=60)
+                            await self._remote(pairing_wait=120)
                         except TVUnavailable as e:
                             self._prompt_at = time.monotonic()
                             self.log.info("remote: %s", e)
                 if self.connected and self.registered:
                     await self._read_power()
                     prev = self.visible
+                    self._fg_changed.clear()   # what this read sees needs no second look
                     self.visible = await self._read_visible()
                     if self.visible != prev and prev is not None and self.visible is not None:
                         self.log.info("screen: %s -> %s", prev or "nothing", self.visible or "nothing")
@@ -553,6 +630,8 @@ class LGTV:
                     was_on = on
                 elif not self.connected:
                     was_on = False   # gone from the network counts as off
+                elif not self.registered and self._key():
+                    was_on = False   # webOS 26 standby: on the network but drops SSAP until switched on
                 after = (self.connected, self.power, self.visible, self._vol.get("level"), self._vol.get("muted"))
                 if after != before:
                     self._changed()
@@ -561,11 +640,36 @@ class LGTV:
             except Exception as e:
                 self.log.warning("watch: %s %s", type(e).__name__, e)
             ticks += 1
-            await asyncio.sleep(2)
+            if (self.back_to_couch and self.registered and self.visible
+                    and self.visible not in (self.app_id, DEVMODE_APP) and not NOTHING.match(self.visible)):
+                await self._wait_app_change(2.0, look_every=0.25)
+            elif self.registered:
+                await self._wait_app_change(2.0 if self.is_on else 1.0)
+            else:
+                await asyncio.sleep(2)
+
+    async def _wait_app_change(self, total, look_every=None):
+        """Wait up to `total` seconds, returning as soon as the TV says the app in front changed
+        (its subscription message), so the main loop handles it at once. look_every: also ask the
+        TV that often, in case a firmware does not send the message."""
+        end = time.monotonic() + total
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            try:
+                await asyncio.wait_for(self._fg_changed.wait(), min(left, look_every or left))
+                return
+            except asyncio.TimeoutError:
+                pass
+            if look_every:
+                now = await self._read_visible()
+                if now is not None and now != self.visible:
+                    return
 
     async def _back_to_couch(self, came_from):
         """An app closed to LG's home: put couch-tv back, unless something else came up."""
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.15)
         if not LG_HOME.match(await self._read_visible() or ""):
             return
         try:
@@ -591,7 +695,7 @@ class LGTV:
         elif time.monotonic() < self.quiet_until:
             self._note("TV came on, left alone (a command is running)")
             return
-        await asyncio.sleep(1.5)   # let the TV settle on whatever it opens by itself
+        await asyncio.sleep(0.8)   # let the TV settle on whatever it opens by itself
         front = await self._read_visible()
         if front and front == self.app_id:
             self._note("TV came on, couch-tv already open")
@@ -608,7 +712,8 @@ class LGTV:
             self._note(f"TV came on in {self._package_of(front)}, left alone")
             return
         if self._devmode_due():
-            await self.extend_devmode_now()
+            if await self.extend_devmode_now():
+                await self._wait_devmode_app()
         if not self.open_on_power_on:
             return
         try:
@@ -649,14 +754,33 @@ class LGTV:
             return   # an app is on screen: try again later
         if self.leave_inputs and INPUT.match(front):
             return   # an input in use: try again later
-        await self.extend_devmode_now()
-        await asyncio.sleep(2)
+        if await self.extend_devmode_now():
+            await self._wait_devmode_app()
+        else:
+            await asyncio.sleep(2)
         now = await self._read_visible()
         if front and now != front:
             try:
                 await self._launch(front, quiet=False)
             except Exception as e:
                 self.log.info("could not put %s back: %s", front, e)
+
+    async def _wait_devmode_app(self, timeout=20.0):
+        """After Extend, Developer Mode's own app takes a few seconds to come up (about 5 s on webOS
+        10) and covers whatever is on screen. Wait for it, up to timeout, so couch-tv goes back on
+        top of it and not underneath it (couch-tv#71). A TV where it never shows is waited on for the
+        full time, so the caller then carries on as before. Returns True when the app appeared."""
+        end = time.monotonic() + timeout
+        while True:
+            try:
+                if await self._read_visible() == DEVMODE_APP:
+                    await asyncio.sleep(0.5)
+                    return True
+            except Exception:
+                pass
+            if time.monotonic() >= end:
+                return False
+            await asyncio.sleep(0.5)
 
     async def extend_devmode_now(self):
         """Press Developer Mode's Extend. Returns True when it reported success."""
@@ -756,12 +880,28 @@ class LGTV:
         self.log.info("Developer Mode left: %s", out.get("hours") if "error" not in out else out["error"])
         return out
 
-    def devmode_warning(self):
-        """A plain sentence when couch-tv is at risk, else None. ("alert" or "warn", text)"""
+    # The warning as a key and numbers, so the TV home and the phone can say it in their language
+    # (devmode_* in tv-home/web/i18n.js and remote/src/i18n.js). The English text below is also sent,
+    # for a TV home or phone that is older than these keys.
+    DEVMODE_WARNINGS = {
+        "devmode_gone": "couch-tv is no longer installed on the TV. Developer Mode probably ran out. "
+                        "Switch Developer Mode on again and ask Claude to reinstall couch-tv.",
+        "devmode_runs_out": "Developer Mode runs out in {days} days, and then LG removes couch-tv. "
+                            "Turn the TV on for a minute so it can be renewed, or press Extend in the "
+                            "Developer Mode app on the TV.",
+        "devmode_not_renewed_left": "Developer Mode has not been renewed for {days} days ({left} days left). "
+                                    "It renews the next time the TV is on.",
+        "devmode_not_renewed": "Developer Mode has not been renewed for {days} days. "
+                               "It renews the next time the TV is on.",
+    }
+
+    def devmode_warning_parts(self):
+        """(level, key, vars) when couch-tv is at risk, else None. level is "alert" or "warn"."""
         ids = {p.get("id") for p in self.launch_points}
-        if self.launch_points and self.app_id not in ids:
-            return ("alert", "couch-tv is no longer installed on the TV. Developer Mode probably ran out. "
-                             "Switch Developer Mode on again and ask Claude to reinstall couch-tv.")
+        # couch-tv on screen is installed, whatever an app list read before it went on says
+        # (the list is read every 30 minutes, so a fresh install would otherwise warn until then)
+        if self.launch_points and self.app_id not in ids and self.visible != self.app_id:
+            return ("alert", "devmode_gone", {})
         if not self.extend_devmode:
             return None
         left = self._left_state()
@@ -769,27 +909,30 @@ class LGTV:
         if h is not None and h_at:
             h -= (time.time() - h_at) / 3600   # it keeps counting down since it was read
             if h < 168:
-                return ("alert", f"Developer Mode runs out in {max(0, int(h // 24))} days, and then LG removes couch-tv. "
-                                 "Turn the TV on for a minute so it can be renewed, or press Extend in the "
-                                 "Developer Mode app on the TV.")
+                return ("alert", "devmode_runs_out", {"days": max(0, int(h // 24))})
             if h < 900:
-                return ("warn", f"Developer Mode has not been renewed for {int((999 - h) // 24)} days "
-                                f"({int(h // 24)} days left). It renews the next time the TV is on.")
+                return ("warn", "devmode_not_renewed_left", {"days": int((999 - h) // 24), "left": int(h // 24)})
             return None
         st = self._devmode_state()
         ok_at = _ts(st.get("last_ok_at") or (st.get("at") if st.get("ok") else None))
         if ok_at and time.time() - ok_at > 3 * 86400:
-            return ("warn", f"Developer Mode has not been renewed for {int((time.time() - ok_at) // 86400)} days. "
-                            "It renews the next time the TV is on.")
+            return ("warn", "devmode_not_renewed", {"days": int((time.time() - ok_at) // 86400)})
         return None
+
+    def devmode_warning(self):
+        """A plain English sentence when couch-tv is at risk, else None. ("alert" or "warn", text)"""
+        w = self.devmode_warning_parts()
+        return (w[0], self.DEVMODE_WARNINGS[w[1]].format(**w[2])) if w else None
 
     def devmode_status(self):
         s = self._devmode_state()
-        left, w = self._left_state(), self.devmode_warning()
+        left, w = self._left_state(), self.devmode_warning_parts()
+        text = self.DEVMODE_WARNINGS[w[1]].format(**w[2]) if w else None
         return {"on": self.extend_devmode, "last": s.get("at"), "ok": s.get("ok"), "how": s.get("how"),
                 "error": s.get("error"), "last_ok": s.get("last_ok_at") or (s.get("at") if s.get("ok") else None), "fails": s.get("fails", 0),
                 "hours_left": left.get("hours"), "hours_read": left.get("hours_at"),
-                "warning": w[1] if w else None, "level": w[0] if w else None}
+                "warning": text, "level": w[0] if w else None,
+                "warning_key": w[1] if w else None, "warning_vars": w[2] if w else None}
 
     # ---------- the remote ----------
     async def _pointer(self):
@@ -798,7 +941,7 @@ class LGTV:
             return self._pointer_ws
         path = (await self._request("com.webos.service.networkinput/getPointerInputSocket")).get("socketPath")
         if not path:
-            raise TVUnavailable("the TV did not give a pointer socket")
+            raise TVUnavailable("the TV did not give a pointer socket", key="err_lg_no_pointer_socket")
         tries = [path]
         if path.startswith("ws://") and (self._url or "").startswith("wss://"):
             tries.append("wss://" + path[5:].replace(":3000/", ":3001/", 1))
@@ -811,7 +954,11 @@ class LGTV:
                 return self._pointer_ws
             except Exception as e:
                 last = e
-        raise TVUnavailable(f"the TV's pointer socket did not open ({type(last).__name__})")
+        raise TVUnavailable(
+            f"the TV's pointer socket did not open ({type(last).__name__})",
+            key="err_lg_pointer_socket_failed",
+            vars={"error": type(last).__name__},
+        )
 
     async def _drain(self, ws):
         try:
@@ -870,7 +1017,7 @@ class LGTV:
             return "couch-tv"
         code = resolve_key(name)
         if not code:
-            raise ValueError(f"unknown key: {name}")
+            raise messages.with_key(ValueError(f"unknown key: {name}"), "err_unknown_key", key=name)
         # The pointer socket has no press and release, so a hold is a press.
         if code == "POWER":
             if self.is_on:
@@ -924,7 +1071,11 @@ class LGTV:
         self.require()
         ids = self._candidates(package)
         if not ids:
-            raise ValueError(f"no LG app id known for {package}")
+            raise messages.with_key(
+                ValueError(f"no LG app id known for {package}"),
+                "err_lg_no_app_id",
+                package=package,
+            )
         await self.refresh_installed()
         installed = [i for i in ids if i in self.ids or i == self.app_id]
         last = None
@@ -934,7 +1085,11 @@ class LGTV:
                 return "remote"
             except LGError as e:
                 last = e
-        raise TVUnavailable(f"the TV would not open {package}: {last}")
+        raise TVUnavailable(
+            f"the TV would not open {package}: {last}",
+            key="err_driver_open_failed",
+            vars={"package": package, "error": str(last)},
+        )
 
     async def start_intent(self, uri, package=None, cold=False):
         """Open a show. Netflix and YouTube links open the title (as LG's own integrations do it);
@@ -951,8 +1106,17 @@ class LGTV:
             lid = (self._candidates(app["package"]) or ["youtube.leanback.v4"])[0]
             await self._launch(lid, params={"contentTarget": f"https://www.youtube.com/tv?v={youtube_id(uri)}"})
             return "remote"
+        if "://" in uri and not pkg:
+            import custom_cards
+            link = custom_cards.web_url(uri)
+            if link:
+                await self._launch("com.webos.app.browser", params={"target": link})
+                return "browser"
         if not pkg:
-            raise ValueError("LG TVs only open links for Netflix and YouTube")
+            raise messages.with_key(
+                ValueError("LG TVs only open links for Netflix and YouTube"),
+                "err_lg_only_netflix_youtube",
+            )
         await self.launch_package(pkg)
         return "app"
 
@@ -986,10 +1150,10 @@ class LGTV:
         return False
 
     async def adb(self, *args, **kw):
-        raise TVUnavailable("this is an LG TV: ADB tools are Android only")
+        raise TVUnavailable("this is an LG TV: ADB tools are Android only", key="err_lg_adb_android_only")
 
     async def screenshot(self):
-        raise TVUnavailable("LG TVs do not give screenshots over the network")
+        raise TVUnavailable("LG TVs do not give screenshots over the network", key="err_lg_no_screenshots")
 
     # ---------- power ----------
     async def port_open(self, port=None, timeout=1.0):
