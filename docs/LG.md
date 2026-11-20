@@ -313,6 +313,44 @@ Environment=COUCHTV_ARES_BIN_DIR=/opt/couchtv-tools/node_modules/.bin
 Environment=COUCHTV_CLAUDE_BIN=/opt/couchtv-tools/claude
 ```
 
+`RuntimeDirectory=` makes `/run/couchtv` only in a **system** service, so run the bridge as one
+with `User=` rather than as a user service. The whole unit, as it runs on the first setup (an
+LG OLED CX, the bridge in a Proxmox container on Ubuntu 26.04, systemd 259), saved as
+`/etc/systemd/system/couch-tv-bridge.service`, then `systemctl enable --now couch-tv-bridge`:
+
+```ini
+[Unit]
+Description=Couch TV bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=couchtv
+Group=couchtv
+WorkingDirectory=/home/couchtv/couch-tv
+Environment=PATH=/home/couchtv/.local/bin:/opt/couchtv-tools/node/bin:/usr/bin:/bin
+Environment=COUCHTV_CREDENTIAL_BACKEND=systemd
+Environment=COUCHTV_CREDENTIAL_SCOPE=user
+Environment=COUCHTV_CREDENTIAL_DIR=/home/couchtv/.local/share/couchtv-credentials
+Environment=COUCHTV_RUNTIME_DIR=/run/couchtv
+Environment=COUCHTV_ARES_BIN_DIR=/opt/couchtv-tools/lg/node_modules/.bin
+Environment=COUCHTV_CLAUDE_BIN=/opt/couchtv-tools/claude
+Environment=CLAUDE_BIN=/home/couchtv/.local/bin/claude-secure
+RuntimeDirectory=couchtv
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+ExecStart=/home/couchtv/couch-tv-venv/bin/python /home/couchtv/couch-tv/bridge/server.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+There, pairing, the daily Extend (`ares-launch`) and the countdown read (`ares-novacom`) all ran
+through the encrypted store from this service.
+
 The runtime directory must already exist, belong to the bridge user, have mode `0700`, and
 reside on a verified `tmpfs` mount. For each CLI invocation the wrapper creates a separate
 private directory there, writes mode-`0600` configuration at
@@ -464,6 +502,10 @@ repo yet.
    `bridge/data/lg-<id>-key.txt` and `bridge/data/lg-<id>-devmode.json`. The client key is then
    gone from the computer. The TV may keep its own note of the accepted remote, which is harmless
    (where to remove it on the TV differs by year and was not checked).
-4. On the computer: `ares-setup-device -r lounge`.
+   With encrypted storage (`COUCHTV_CREDENTIAL_BACKEND=systemd`) the key is not in `bridge/data`:
+   delete `lg-<id>-client-key.cred`, and `lg-ares-config.cred` (the Developer Mode profile), from
+   `COUCHTV_CREDENTIAL_DIR` instead, and `claude-oauth.cred` if the assistant used one.
+4. On the computer: `ares-setup-device -r lounge` (with encrypted storage there is no ares profile
+   to remove: deleting `lg-ares-config.cred` in step 3 did it).
 
 Nothing else on the TV was changed.
