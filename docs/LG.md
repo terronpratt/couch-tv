@@ -555,7 +555,7 @@ TV to its input while couch-tv is loading), opening the input does not wake the 
 HDMI 2 comes up from couch-tv (an input tile or the Input button), LG's home or LG's input screen and
 stays for a second, the bridge wakes that device ([CONFIG.md](CONFIG.md), The TVs). Tried on an LG
 OLED65CX (webOS 5) with an Apple TV on HDMI 2: asleep for a minute, it was awake about 7 seconds after the
-wake. An app closing to the input (holding Back in Netflix) and the TV coming on in it do not wake it.
+wake. An app closing to the input (holding Back in Netflix), couch-tv itself closing to it (seen during a reinstall: couch-tv, an empty screen, then HDMI 2) and the TV coming on in it do not wake it.
 
 **The Magic Remote on that box.** With SIMPLINK on, the remote's arrows, OK, Back and Play/Pause reach
 the box over HDMI-CEC. On that CX they did nothing at first although the input was named "Apple HDMI2":

@@ -631,7 +631,9 @@ class LGTV:
                             came = self._left_app[0]
                         if was_on and self._closed_to_couch_target(came, self.visible):
                             asyncio.create_task(self._back_to_couch(came, self.visible))
-                        woke = self._input_wake_target(came, self.visible) if was_on else None
+                        # prev, not came: couch-tv closing (reinstalled, or quit) falls to the input through an
+                        # empty screen, which came would count as couch-tv opening it; picking it is direct
+                        woke = self._input_wake_target(prev, self.visible) if was_on else None
                         if woke:
                             asyncio.create_task(self._wake_for_input(*woke, self.visible))
                     if self.is_on:
@@ -709,7 +711,8 @@ class LGTV:
         """wake_on_input: did couch-tv (its input tile or Input button), LG's home or LG's input screen
         just open an HDMI input with a device to wake? (port, tv id), else None. An app closing to
         the input (holding Back in Netflix, which back_to_couch_inputs undoes), the TV coming on in
-        it, and LG's Device Connector are left alone."""
+        it, couch-tv closing to it through an empty screen (the watcher passes the screen just before,
+        not the app the empty screen came from), and LG's Device Connector are left alone."""
         m = HDMI_PORT.match(now or "")
         if not m or m.group(1) not in self.wake_on_input or self._extending:
             return None
