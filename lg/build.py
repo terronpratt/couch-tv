@@ -34,6 +34,7 @@ installed this script's. --packer auto is the old default: ares-package if insta
 """
 import argparse
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -43,8 +44,10 @@ import ssl
 import subprocess
 import sys
 import tarfile
+import struct
 import time
 import urllib.request
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -236,6 +239,139 @@ def fetch_tv_icons(baked, logos_dir, logos):
     return got
 
 
+# The logos are drawn at most about 175 px across on the 1920 x 1080 page (a dock tile magnified), but
+# most are 512 x 512: about 1 MB each once the TV has decoded them, and slow to decode on an older LG.
+LOGO_MAX = 256
+
+
+def _png_rows(data):
+    """An 8-bit, non-interlaced RGB or RGBA PNG as (width, height, channels, rows), else None."""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    pos, idat, head = 8, [], None
+    while pos + 8 <= len(data):
+        n, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + n]
+        if kind == b"IHDR":
+            head = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat.append(body)
+        elif kind == b"IEND":
+            break
+        pos += 12 + n
+    if not head:
+        return None
+    w, h, depth, ctype, _, _, interlace = head
+    if depth != 8 or interlace or ctype not in (2, 6):
+        return None   # palette, grey, 16-bit or interlaced: left as it is
+    ch = 3 if ctype == 2 else 4
+    raw, stride = zlib.decompress(b"".join(idat)), w * ch
+    rows, prev = [], bytearray(stride)
+    for y in range(h):
+        f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        if f == 1:
+            for i in range(ch, stride):
+                line[i] = (line[i] + line[i - ch]) & 255
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif f == 3:
+            for i in range(stride):
+                line[i] = (line[i] + ((line[i - ch] if i >= ch else 0) + prev[i]) // 2) & 255
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                b, c = prev[i], prev[i - ch] if i >= ch else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        elif f != 0:
+            return None
+        rows.append(line)
+        prev = line
+    return w, h, ch, rows
+
+
+def _png_write(w, h, ch, rows):
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    raw = bytearray()
+    for line in rows:   # filter 1 (Sub) on every line: simple, and it packs logos well
+        raw.append(1)
+        raw += bytes(line[:ch]) + bytes((line[i] - line[i - ch]) & 255 for i in range(ch, len(line)))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2 if ch == 3 else 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+
+def shrink_png(data, most=LOGO_MAX):
+    """A PNG wider or taller than `most`, made smaller by a whole factor (512 -> 256), else None.
+
+    Each new pixel is the average of the block it covers, weighted by how opaque each pixel is,
+    so a logo's edge does not get a dark fringe. Only plain 8-bit RGB and RGBA PNGs are shrunk.
+    """
+    got = _png_rows(data)
+    if not got:
+        return None
+    w, h, ch, rows = got
+    k = -(-max(w, h) // most)
+    if k < 2:
+        return None
+    nw, nh, n = w // k, h // k, k * k
+    out = []
+    for by in range(nh):
+        block, line = rows[by * k:(by + 1) * k], bytearray(nw * ch)
+        for bx in range(nw):
+            x0, x1 = bx * k * ch, (bx + 1) * k * ch
+            if ch == 3:
+                for c in range(3):
+                    line[bx * 3 + c] = (sum(sum(r[x0 + c:x1:3]) for r in block) + n // 2) // n
+                continue
+            alpha = sum(sum(r[x0 + 3:x1:4]) for r in block)
+            line[bx * 4 + 3] = (alpha + n // 2) // n
+            if not alpha:
+                continue
+            for c in range(3):
+                tot = 0
+                for r in block:
+                    seg = r[x0:x1]
+                    tot += sum(seg[i + c] * seg[i + 3] for i in range(0, len(seg), 4))
+                line[bx * 4 + c] = min(255, (tot + alpha // 2) // alpha)
+        out.append(line)
+    return _png_write(nw, nh, ch, out)
+
+
+def shrink_logos(logos_dir, cache_dir):
+    """Shrink every logo bigger than LOGO_MAX in the package, keeping each result for the next build."""
+    os.makedirs(cache_dir, exist_ok=True)
+    done = before = after = 0
+    for name in sorted(os.listdir(logos_dir)):
+        if not name.endswith(".png"):
+            continue
+        path = os.path.join(logos_dir, name)
+        with open(path, "rb") as f:
+            data = f.read()
+        kept = os.path.join(cache_dir, hashlib.sha256(data).hexdigest() + f"-{LOGO_MAX}.png")
+        if os.path.exists(kept):
+            with open(kept, "rb") as f:
+                small = f.read() or None   # an empty file: this one is not shrunk
+        else:
+            try:
+                small = shrink_png(data)
+            except (zlib.error, struct.error, IndexError, ValueError):
+                small = None   # not a PNG this can read: it goes in as it is
+            with open(kept, "wb") as f:
+                f.write(small or b"")
+        if small:
+            w, h = struct.unpack(">II", data[16:24])
+            sw, sh = struct.unpack(">II", small[16:24])
+            before, after, done = before + w * h * 4, after + sw * sh * 4, done + 1
+            with open(path, "wb") as f:
+                f.write(small)
+    if done:
+        print(f"logos: {done} shrunk to {LOGO_MAX} px, about {before / 1e6:.1f} MB to {after / 1e6:.1f} MB once decoded")
+    return done
+
+
 def pack_python(stage, info, ipk):
     app_id, version = info["id"], info["version"]
     files = []
@@ -311,6 +447,7 @@ def main():
             logos.add(name[:-4])
     if baked:
         fetch_tv_icons(baked, os.path.join(stage, "logos"), logos)
+    shrink_logos(os.path.join(stage, "logos"), os.path.join(OUT, "logo-cache"))
 
     css_path = os.path.join(stage, "app.css")
     with open(css_path) as f:
