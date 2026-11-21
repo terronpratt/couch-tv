@@ -71,6 +71,23 @@ OFF_STATES = {"Power Off", "Suspend", "Active Standby"}
 INPUT = re.compile(r"^com\.webos\.app\.(hdmi\d*|externalinput\..+)$")
 LG_HOME = re.compile(r"^com\.webos\.app\.(home|homeconnect|launcher)$")
 NOTHING = re.compile(r"^$|^com\.webos\.app\.(home|homeconnect|launcher|livetv|hdmi\d*|externalinput\..+|inputcommon)$")
+# An HDMI input by its port (wake_on_input), and LG's input screen on webOS versions that have one.
+HDMI_PORT = re.compile(r"^com\.webos\.app\.hdmi(\d+)$")
+INPUT_SCREEN = "com.webos.app.inputcommon"
+WAKE_AGAIN_SECS = 30   # wake_on_input: at most one wake per port in this time
+
+
+def _wake_map(raw):
+    """wake_on_input from config.json, {"2": "<tv id>"}, as {"2": "<tv id>"}; anything else is dropped."""
+    out = {}
+    for port, target in (raw.items() if isinstance(raw, dict) else ()):
+        try:
+            port = str(int(port))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(target, str) and target.strip():
+            out[port] = target.strip()
+    return out
 
 # Friendly key name -> the pointer socket's button name (aiowebostv's list).
 KEYS = {
@@ -161,6 +178,11 @@ class LGTV:
         self.back_to_couch = cfg.get("back_to_couch", False) is True
         # true (with back_to_couch): an app closing straight to an HDMI input reopens couch-tv too
         self.back_to_couch_inputs = cfg.get("back_to_couch_inputs", False) is True
+        # {"2": "<tv id>"}: HDMI 2 opened from couch-tv, LG's home or LG's input screen wakes that device
+        # on this bridge (an Apple TV), for a TV with SIMPLINK's Auto Power Sync off
+        self.wake_on_input = _wake_map(cfg.get("wake_on_input"))
+        self.wake_device = None     # set by the server: async fn(tv id) that wakes another device
+        self._woke_port_at = {}
         self.ares_device = cfg.get("ares_device") or self.id
         self.ares_launch = cfg.get("ares_launch") or os.environ.get("ARES_LAUNCH") or None
         self.ports = [int(cfg["port"])] if cfg.get("port") else [3000, 3001]
@@ -609,6 +631,9 @@ class LGTV:
                             came = self._left_app[0]
                         if was_on and self._closed_to_couch_target(came, self.visible):
                             asyncio.create_task(self._back_to_couch(came, self.visible))
+                        woke = self._input_wake_target(came, self.visible) if was_on else None
+                        if woke:
+                            asyncio.create_task(self._wake_for_input(*woke, self.visible))
                     if self.is_on:
                         await self.refresh_installed()
                         if ticks % 3 == 0:
@@ -679,6 +704,36 @@ class LGTV:
             return False
         return (bool(came) and came not in (self.app_id, DEVMODE_APP) and not NOTHING.match(came)
                 and not self._extending and time.monotonic() >= self.quiet_until)
+
+    def _input_wake_target(self, came, now):
+        """wake_on_input: did couch-tv (its input tile or Input button), LG's home or LG's input screen
+        just open an HDMI input with a device to wake? (port, tv id), else None. An app closing to
+        the input (holding Back in Netflix, which back_to_couch_inputs undoes), the TV coming on in
+        it, and LG's Device Connector are left alone."""
+        m = HDMI_PORT.match(now or "")
+        if not m or m.group(1) not in self.wake_on_input or self._extending:
+            return None
+        if not came or not (came == self.app_id or LG_HOME.match(came) or came == INPUT_SCREEN):
+            return None
+        return m.group(1), self.wake_on_input[m.group(1)]
+
+    async def _wake_for_input(self, port, target, where):
+        """Wake the device on that input once the TV has stayed on it for a second: a wake on a
+        passing screen could let the device pull the TV back to its input over HDMI-CEC."""
+        await asyncio.sleep(1.0)
+        if time.monotonic() - self._woke_port_at.get(port, -WAKE_AGAIN_SECS) < WAKE_AGAIN_SECS:
+            return
+        if not self.is_on or await self._read_visible() != where:
+            return
+        self._woke_port_at[port] = time.monotonic()
+        if self.wake_device is None:
+            self._note(f"HDMI {port} opened, nothing set up to wake {target}")
+            return
+        try:
+            await self.wake_device(target)
+            self._note(f"HDMI {port} opened, woke {target}")
+        except Exception as e:
+            self._note(f"HDMI {port} opened, could not wake {target}: {e}")
 
     async def _back_to_couch(self, came_from, where=None):
         """An app closed to LG's home (or an input): put couch-tv back, unless something else came up."""

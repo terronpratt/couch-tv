@@ -549,6 +549,20 @@ just asked for also wins: the hook stays quiet for 20 seconds after any command,
 press, so turning the TV on from the phone also lands on couch-tv. `"open_on_power_on": false` in
 `config.json` turns the hook off.
 
+**Waking the box on an input.** With SIMPLINK's Auto Power Sync off (so a box on HDMI cannot pull the
+TV to its input while couch-tv is loading), opening the input does not wake the box either.
+`"wake_on_input": {"2": "<id>"}` on the LG's entry fixes that for a box the bridge also controls: when
+HDMI 2 comes up from couch-tv (an input tile or the Input button), LG's home or LG's input screen and
+stays for a second, the bridge wakes that device ([CONFIG.md](CONFIG.md), The TVs). Tried on an LG
+OLED65CX (webOS 5) with an Apple TV on HDMI 2: asleep for a minute, it was awake about 7 seconds after the
+wake. An app closing to the input (holding Back in Netflix) and the TV coming on in it do not wake it.
+
+**The Magic Remote on that box.** With SIMPLINK on, the remote's arrows, OK, Back and Play/Pause reach
+the box over HDMI-CEC. On that CX they did nothing at first although the input was named "Apple HDMI2":
+an earlier setup had registered the Apple TV in LG's Device Connector as an infrared set-top box, so the
+remote sent another box's infrared codes. Removing it there (it took two tries) and restarting the TV
+fixed it.
+
 Netflix titles open with the title in the launch (`contentId`), YouTube videos with the video's
 address (`contentTarget`), as LG's own integrations do. Other apps just open.
 

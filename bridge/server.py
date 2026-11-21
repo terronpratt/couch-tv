@@ -2019,6 +2019,14 @@ async def h_power(request):
 POWER_ON_BUDGET = 32  # seconds; the phone app waits 40
 
 
+async def _wake_other(tv_id):
+    """An LG's wake_on_input: wake another device on this bridge (the Apple TV on that HDMI port)."""
+    other = TVS.get(tv_id)
+    if other is None or not hasattr(other, "wake"):
+        raise RuntimeError(f"no device {tv_id!r} in tvs to wake")
+    await other.wake()
+
+
 async def power_on():
     """Turn the TV on and only return once it says it is on (or the budget runs out).
 
@@ -5256,6 +5264,11 @@ def make_app():
         if config.HOME.get("look") == "loop" and not config.HOME["loop"]["variants"]:
             log.warning("the Loop look has no files yet: run scripts/make-loop.sh on this computer (docs/LOOP.md)")
         for tv_id, t in TVS.items():
+            if getattr(t, "wake_on_input", None):
+                t.wake_device = _wake_other
+                for port, other in t.wake_on_input.items():
+                    if not hasattr(TVS.get(other), "wake"):
+                        log.warning("%s: wake_on_input HDMI %s names %r, which is not a device in tvs", tv_id, port, other)
             t.on_change(lambda tv_id=tv_id: with_tv(tv_id, push_now))
             t.on_change(lambda tv_id=tv_id: with_tv(tv_id, _maybe_refresh_installed))
             t.on_change(lambda tv_id=tv_id: with_tv(tv_id, _close_on_off))
