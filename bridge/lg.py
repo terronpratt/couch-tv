@@ -1200,7 +1200,10 @@ class LGTV:
         return self.current_package
 
     async def wait_for_app(self, packages, timeout=8.0):
+        # an LG id asked for (app.couchtv.home) comes back as its package (app.couchtv.launcher): count
+        # both, or a launch that worked was reported as "not installed" after 8 seconds
         packages = {p for p in packages if p}
+        packages |= {self._package_of(p) for p in packages} - {None}
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             front = await self.front_package()
